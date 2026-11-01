@@ -27,5 +27,7 @@ Incoming files are fingerprinted by their header layout, control-flow dispatcher
 | `constant_array` | WeAreDevs / basic string array packers | Simulates array queue rotations (`table.insert`/`remove`), resolves index offsets, and inlines strings. |
 | `math_expression` | General math, bitwise, string-byte, and escape-sequence obfuscation | Precedence-exact constant folding for `math.*`, `bit32.*`, `string.*`, concatenations, and arithmetic. |
 ---
-## Internal Architecture & Mechanical Flow
-```
+## Installation 
+### make sure u have git bud
+```bash
+git clone https://github.com/roulettegun/LUA-Deobfuscater/
