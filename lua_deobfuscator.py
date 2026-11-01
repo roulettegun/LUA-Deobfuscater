@@ -1307,6 +1307,7 @@ def pretty_print_lua(tokens: list[Token]) -> str:
                 i += 2
                 continue
             cur_scope['brace'] += 1
+            cur_scope.setdefault('brace_parens', []).append(cur_scope['paren'])
             cur_line.append(tk)
             flush()
             indent_level += 1
@@ -1315,6 +1316,8 @@ def pretty_print_lua(tokens: list[Token]) -> str:
 
         if val == '}':
             cur_scope['brace'] = max(0, cur_scope['brace'] - 1)
+            if cur_scope.get('brace_parens'):
+                cur_scope['brace_parens'].pop()
             flush()
             indent_level = max(0, indent_level - 1)
             cur_line.append(tk)
@@ -1325,7 +1328,8 @@ def pretty_print_lua(tokens: list[Token]) -> str:
 
         if val == ',':
             cur_line.append(tk)
-            if cur_scope['brace'] > 0 and cur_scope['paren'] == 0 and cur_scope['bracket'] == 0:
+            bp = cur_scope.get('brace_parens')
+            if cur_scope['brace'] > 0 and bp and cur_scope['paren'] == bp[-1] and cur_scope['bracket'] == 0:
                 flush()
             i += 1
             continue
@@ -1919,13 +1923,783 @@ def _symbolically_resolve_vm_state(
     return body, decrypted_pairs
 
 
+def _parse_vm_leaf_statements(body: str) -> list[tuple[list[str], list[str]]]:
+    """Parse flat Prometheus VM leaf assignments into (lhs_list, rhs_list) pairs."""
+    toks = tokenize_lua(body)
+    stmts: list[tuple[list[str], list[str]]] = []
+    i = 0
+    n = len(toks)
+
+    def read_expr(pos: int) -> tuple[str, int]:
+        depth = 0
+        out: list[str] = []
+        while pos < n:
+            t = toks[pos]
+            if t.val in ('(', '{', '['):
+                depth += 1
+                out.append(t.val)
+                pos += 1
+            elif t.val in (')', '}', ']'):
+                if depth > 0:
+                    depth -= 1
+                    out.append(t.val)
+                    pos += 1
+                else:
+                    break
+            elif depth == 0:
+                if t.val in (',', ';'):
+                    break
+                if out and out[-1] not in ('and', 'or', 'not', '+', '-', '*', '/', '//', '%', '^', '..', '==', '~=', '<', '>', '<=', '>='):
+                    k = pos
+                    is_lhs = False
+                    while k < n:
+                        if toks[k].kind == 'word':
+                            k += 1
+                            while k < n and toks[k].val == '[':
+                                b_depth = 1
+                                k += 1
+                                while k < n and b_depth > 0:
+                                    if toks[k].val == '[':
+                                        b_depth += 1
+                                    elif toks[k].val == ']':
+                                        b_depth -= 1
+                                    k += 1
+                            if k < n and toks[k].val == ',':
+                                k += 1
+                                continue
+                            elif k < n and toks[k].val == '=':
+                                is_lhs = True
+                                break
+                            else:
+                                break
+                        else:
+                            break
+                    if is_lhs:
+                        break
+                out.append(t.val)
+                pos += 1
+            else:
+                out.append(t.val)
+                pos += 1
+        return ' '.join(out), pos
+
+    while i < n:
+        if toks[i].val == ';':
+            i += 1
+            continue
+        lhs: list[str] = []
+        while i < n:
+            if toks[i].kind == 'word':
+                lv = toks[i].val
+                i += 1
+                while i < n and toks[i].val == '[':
+                    b_depth = 1
+                    sub = ['[']
+                    i += 1
+                    while i < n and b_depth > 0:
+                        if toks[i].val == '[':
+                            b_depth += 1
+                        elif toks[i].val == ']':
+                            b_depth -= 1
+                        sub.append(toks[i].val)
+                        i += 1
+                    lv += ' '.join(sub)
+                lhs.append(lv)
+                if i < n and toks[i].val == ',':
+                    i += 1
+                elif i < n and toks[i].val == '=':
+                    i += 1
+                    break
+                else:
+                    break
+            else:
+                i += 1
+                break
+        if not lhs:
+            break
+        rhs: list[str] = []
+        while i < n:
+            expr, i = read_expr(i)
+            rhs.append(expr)
+            if i < n and toks[i].val == ',':
+                i += 1
+            else:
+                break
+        stmts.append((lhs, rhs))
+    return stmts
+
+
+def _decompile_prometheus_vm_to_lua(
+    folded_vm: str,
+    l1: PrometheusLayer1,
+    state_var: str,
+    raw_leaves: list[tuple[int, int, str]],
+    prng_params: dict[str, int],
+) -> str | None:
+    """Decompile Prometheus VM state graph and closures into clean, editable Luau code."""
+    def find_leaf(state_val: int) -> int | None:
+        for idx, (lo, hi, _) in enumerate(raw_leaves):
+            if lo <= state_val <= hi:
+                return idx
+        return None
+
+    leaves_inlined: list[str] = []
+    for _, _, body in raw_leaves:
+        if l1.idx_fn:
+            def repl_idx(m: re.Match) -> str:
+                d_idx = int(m.group(1)) + l1.offset
+                return f'{l1.tbl_var}[{d_idx}]'
+            b = re.sub(rf'\b{re.escape(l1.idx_fn)}\s*\(\s*(-?\d+)\s*\)', repl_idx, body)
+        else:
+            b = body
+        leaves_inlined.append(b)
+
+    toks = tokenize_lua(folded_vm)
+    fn_idx = next((i for i, t in enumerate(toks[:15]) if t.val == 'function'), -1)
+    if fn_idx == -1:
+        return None
+    close_idx = next((i for i in range(fn_idx + 1, len(toks)) if toks[i].val == ')'), -1)
+    if close_idx == -1:
+        return None
+
+    outer_params = [t.val for t in toks[fn_idx + 2 : close_idx] if t.kind == 'word']
+    env_var = outer_params[3] if len(outer_params) >= 4 else 'D'
+    unpack_var = outer_params[5] if len(outer_params) >= 6 else 'H'
+
+    lhs_vars: list[str] = []
+    idx = close_idx + 1
+    while idx < len(toks) and toks[idx].val != '=':
+        if toks[idx].kind == 'word':
+            lhs_vars.append(toks[idx].val)
+        idx += 1
+
+    idx += 1
+    rhs_exprs: list[str] = []
+    depth = 0
+    cur: list[Token] = []
+    while idx < len(toks):
+        t = toks[idx]
+        if t.val in ('(', '{', '[', 'function', 'do', 'if'):
+            if not (t.val == 'if' and is_expr_if(toks, idx)):
+                depth += 1
+        elif t.val in (')', '}', ']', 'end'):
+            depth -= 1
+        if depth == 0 and t.val == ',':
+            rhs_exprs.append(tokens_to_compact_lua(cur))
+            cur = []
+            idx += 1
+            continue
+        if depth == 0 and t.val == 'return' and cur:
+            rhs_exprs.append(tokens_to_compact_lua(cur))
+            break
+        cur.append(t)
+        idx += 1
+
+    closure_arity: dict[str, int] = {}
+    for v, expr in zip(lhs_vars, rhs_exprs):
+        m_fn = re.search(r'local\s+[A-Za-z_]\w*\s*=\s*function\s*\(([^)]*)\)', expr)
+        if m_fn:
+            params_str = m_fn.group(1).strip()
+            if params_str == '...':
+                closure_arity[v] = -1
+            elif not params_str:
+                closure_arity[v] = 0
+            else:
+                closure_arity[v] = len([p.strip() for p in params_str.split(',')])
+
+    m_vm_fn = re.search(
+        rf'function\s*\(\s*({re.escape(state_var)})\s*,\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*,\s*([A-Za-z_]\w*)\s*\)',
+        folded_vm,
+    )
+    args_var = m_vm_fn.group(2) if m_vm_fn else 'R'
+    upvals_var = m_vm_fn.group(3) if m_vm_fn else 'n'
+
+    m_ret = re.search(
+        rf'\bend\s+{re.escape(state_var)}\s*=\s*#[A-Za-z_]\w*\s+return\s+[A-Za-z_]\w*\s*\(\s*([A-Za-z_]\w*)\s*\)',
+        folded_vm,
+    )
+    ret_var = m_ret.group(1) if m_ret else 'O'
+
+    all_leaf_text = '\n'.join(leaves_inlined)
+    m_upv_tbl = re.search(rf'\b([A-Za-z_]\w*)\s*\[\s*{re.escape(upvals_var)}\s*\[\s*\d+\s*\]\s*\]', all_leaf_text)
+    upv_tbl_var = m_upv_tbl.group(1) if m_upv_tbl else 'W'
+
+    m_alloc = re.findall(r'\b[A-Za-z_]\w*\s*=\s*([A-Za-z_]\w*)\s*\(\s*\)', all_leaf_text)
+    alloc_counts: dict[str, int] = {}
+    for fn_a in m_alloc:
+        alloc_counts[fn_a] = alloc_counts.get(fn_a, 0) + 1
+    alloc_var = max(alloc_counts, key=alloc_counts.get) if alloc_counts else 'L'
+
+    m_dealloc = re.findall(r'\b([A-Za-z_]\w*)\s*=\s*([A-Za-z_]\w*)\s*\(\s*\1\s*\)', all_leaf_text)
+    dealloc_counts: dict[str, int] = {}
+    for _, fn_d in m_dealloc:
+        dealloc_counts[fn_d] = dealloc_counts.get(fn_d, 0) + 1
+    dealloc_var = max(dealloc_counts, key=dealloc_counts.get) if dealloc_counts else 'f'
+
+    parsed_leaves = [_parse_vm_leaf_statements(b) for b in leaves_inlined]
+
+    payload_leaf = None
+    for idx_l, b in enumerate(leaves_inlined):
+        l1_refs = [
+            l1.strings_latin1[int(m.group(1))]
+            for m in re.finditer(rf'\b{re.escape(l1.tbl_var)}\s*\[\s*(\d+)\s*\]', b)
+            if 1 <= int(m.group(1)) < len(l1.strings_latin1)
+        ]
+        if 'setmetatable' in l1_refs and '__index' in l1_refs:
+            payload_leaf = idx_l
+            break
+    if payload_leaf is None:
+        return None
+
+    lua_keywords = {
+        'and', 'break', 'do', 'else', 'elseif', 'end', 'false', 'for',
+        'function', 'if', 'in', 'local', 'nil', 'not', 'or', 'repeat',
+        'return', 'then', 'true', 'until', 'while',
+    }
+
+    def is_valid_lua_ident(s: str) -> bool:
+        return bool(re.fullmatch(r'[A-Za-z_][A-Za-z0-9_]*', s)) and s not in lua_keywords
+
+    def val_to_lua(v: tuple | None) -> str:
+        if v is None:
+            return 'nil'
+        kind = v[0]
+        if kind == 'L1_STR':
+            return v[3]
+        if kind in ('STR', 'INT', 'NUM'):
+            return v[2]
+        if kind in ('LIT', 'GLOBAL', 'VAR', 'EXPR', 'CALL', 'CLOSURE_REF'):
+            return v[1]
+        if kind == 'TABLE_1':
+            return v[2]
+        if kind == 'INDEX':
+            return v[3]
+        return str(v[-1])
+
+    def val_raw_str(v: tuple | None) -> str | None:
+        if v is None:
+            return None
+        if v[0] == 'L1_STR':
+            return v[2]
+        if v[0] == 'STR':
+            return v[1]
+        return None
+
+    def format_prop_access(obj_str: str, key_val: tuple | None) -> str:
+        raw_k = val_raw_str(key_val)
+        if raw_k is not None and is_valid_lua_ident(raw_k):
+            return f'{obj_str}.{raw_k}'
+        return f'{obj_str}[{val_to_lua(key_val)}]'
+
+    def split_top_level(s: str, sep: str = ',') -> list[str]:
+        sub_toks = tokenize_lua(s)
+        parts: list[str] = []
+        cur_p: list[str] = []
+        d = 0
+        for t in sub_toks:
+            if t.val in ('(', '{', '['):
+                d += 1
+                cur_p.append(t.val)
+            elif t.val in (')', '}', ']'):
+                d -= 1
+                cur_p.append(t.val)
+            elif d == 0 and (t.val == sep or (sep == ',' and t.val == ';')):
+                parts.append(' '.join(cur_p).strip())
+                cur_p = []
+            else:
+                cur_p.append(t.val)
+        if cur_p:
+            parts.append(' '.join(cur_p).strip())
+        return [p for p in parts if p]
+
+    def find_used_arity(start_leaf: int | None) -> int:
+        if start_leaf is None:
+            return 0
+        vis: set[int] = set()
+        queue = [start_leaf]
+        max_arg = 0
+        arg_re = re.compile(rf'\b{re.escape(args_var)}\s*\[\s*(\d+)\s*\]')
+        while queue:
+            lf = queue.pop(0)
+            if lf is None or lf in vis:
+                continue
+            vis.add(lf)
+            for m in arg_re.finditer(leaves_inlined[lf]):
+                max_arg = max(max_arg, int(m.group(1)))
+            for lhs_l, rhs_l in parsed_leaves[lf]:
+                if state_var in lhs_l:
+                    jmp = rhs_l[lhs_l.index(state_var)]
+                    for m_n in re.finditer(r'\b(\d{5,9})\b', jmp):
+                        nxt = find_leaf(int(m_n.group(1)))
+                        if nxt is not None and nxt not in vis:
+                            queue.append(nxt)
+        return max_arg
+
+    def does_closure_return_value(start_leaf: int | None) -> bool:
+        if start_leaf is None:
+            return False
+        vis: set[int] = set()
+        queue = [start_leaf]
+        while queue:
+            lf = queue.pop(0)
+            if lf is None or lf in vis:
+                continue
+            vis.add(lf)
+            for lhs_l, rhs_l in parsed_leaves[lf]:
+                if ret_var in lhs_l:
+                    r_expr = rhs_l[lhs_l.index(ret_var)].strip()
+                    if r_expr.startswith('{') and r_expr != '{ }':
+                        return True
+                if state_var in lhs_l:
+                    jmp = rhs_l[lhs_l.index(state_var)]
+                    for m_n in re.finditer(r'\b(\d{5,9})\b', jmp):
+                        nxt = find_leaf(int(m_n.group(1)))
+                        if nxt is not None and nxt not in vis:
+                            queue.append(nxt)
+        return False
+
+    upv_slots: dict[str, tuple] = {}
+    void_fns: set[str] = set()
+    var_counter = [0]
+
+    def new_var(hint: str = 'v') -> str:
+        var_counter[0] += 1
+        return f'{hint}_{var_counter[0]}'
+
+    def lift_closure_to_lua(start_leaf: int | None, arity: int, upvals_list: list[str]) -> str:
+        params = [f'arg_{i}' for i in range(1, arity + 1)] if arity > 0 else (['...'] if arity == -1 else [])
+        body_lines, _, _ = decompile_cfg(start_leaf, {}, upvals_list)
+        inner = '\n'.join('    ' + l for l in body_lines)
+        return f'function({", ".join(params)})\n{inner}\nend'
+
+    def decompile_cfg(
+        leaf_idx: int | None,
+        env: dict[str, tuple],
+        upvals_list: list[str],
+        stop_leaf: int | None = None,
+        visited: set[int] | None = None,
+    ) -> tuple[list[str], dict[str, tuple], int | None]:
+        if visited is None:
+            visited = set()
+        if leaf_idx is None or leaf_idx == stop_leaf or leaf_idx in visited:
+            return [], env, leaf_idx
+        visited = visited | {leaf_idx}
+        stmts = parsed_leaves[leaf_idx]
+        out_lines: list[str] = []
+        cur_env = dict(env)
+
+        start_s = 0
+        if leaf_idx == payload_leaf:
+            for idx_s, (lhs, _) in enumerate(stmts[:40]):
+                if f'{upv_tbl_var}[ P ]' in lhs:
+                    start_s = idx_s + 1
+                    break
+            for idx_s in range(start_s):
+                lhs, rhs = stmts[idx_s]
+                for l_var, r in zip(lhs, rhs):
+                    if l_var == f'{upv_tbl_var}[ C ]':
+                        upv_slots['__L2_CACHE__'] = ('L2_CACHE',)
+                        cur_env['C'] = ('UPV_SLOT', '__L2_CACHE__')
+                    elif l_var == f'{upv_tbl_var}[ P ]':
+                        upv_slots['__L2_DEC__'] = ('L2_DEC',)
+                        cur_env['P'] = ('UPV_SLOT', '__L2_DEC__')
+                    elif r == f'{alloc_var} ( )':
+                        cur_env[l_var] = ('UPV_SLOT', f'upv_{leaf_idx}_{idx_s}')
+                    elif re.fullmatch(rf'{re.escape(l1.tbl_var)}\s*\[\s*(\d+)\s*\]', r):
+                        d_i = int(re.fullmatch(rf'{re.escape(l1.tbl_var)}\s*\[\s*(\d+)\s*\]', r).group(1))
+                        cur_env[l_var] = ('L1_STR', d_i, l1.strings_latin1[d_i], bytes_to_lua_string(l1.strings_bytes[d_i]))
+                    elif re.fullmatch(r'-?\s*\d+', r):
+                        clean_num = r.replace(' ', '')
+                        cur_env[l_var] = ('INT', int(clean_num), clean_num)
+
+        def eval_expr(r: str, idx_s: int) -> tuple:
+            r = r.strip()
+            if r == f'{alloc_var} ( )':
+                return ('UPV_SLOT', f'upv_{leaf_idx}_{idx_s}')
+            if re.fullmatch(rf'{re.escape(dealloc_var)}\s*\(\s*[A-Za-z_]\w*\s*\)', r):
+                return ('LIT', 'nil')
+            m_d = re.fullmatch(rf'{re.escape(l1.tbl_var)}\s*\[\s*(\d+)\s*\]', r)
+            if m_d:
+                d_i = int(m_d.group(1))
+                if 1 <= d_i < len(l1.strings_bytes):
+                    return ('L1_STR', d_i, l1.strings_latin1[d_i], bytes_to_lua_string(l1.strings_bytes[d_i]))
+            m_dg = re.fullmatch(rf'{re.escape(env_var)}\s*\[\s*([A-Za-z_]\w*)\s*\]', r)
+            if m_dg:
+                reg = m_dg.group(1)
+                v = cur_env.get(reg)
+                raw_s = val_raw_str(v)
+                if raw_s is not None:
+                    return ('GLOBAL', raw_s)
+            m_arg = re.fullmatch(rf'{re.escape(args_var)}\s*\[\s*(\d+)\s*\]', r)
+            if m_arg:
+                a_i = int(m_arg.group(1))
+                return ('VAR', f'arg_{a_i}')
+            m_upv_n = re.fullmatch(rf'{re.escape(upv_tbl_var)}\s*\[\s*{re.escape(upvals_var)}\s*\[\s*(\d+)\s*\]\s*\]', r)
+            if m_upv_n:
+                u_i = int(m_upv_n.group(1)) - 1
+                if 0 <= u_i < len(upvals_list):
+                    u_key = upvals_list[u_i]
+                    if u_key in upv_slots:
+                        return upv_slots[u_key]
+                    return ('VAR', str(u_key))
+            m_w = re.fullmatch(rf'{re.escape(upv_tbl_var)}\s*\[\s*([A-Za-z_]\w*)\s*\]', r)
+            if m_w:
+                slot_reg = m_w.group(1)
+                slot_val = cur_env.get(slot_reg)
+                if slot_val and slot_val[0] == 'UPV_SLOT':
+                    slot_id = slot_val[1]
+                    if slot_id in upv_slots:
+                        return upv_slots[slot_id]
+                    return ('VAR', slot_id)
+            if re.fullmatch(r'-?\s*\d+(?:\.\d+)?', r):
+                clean_num = r.replace(' ', '')
+                if clean_num.startswith('.'):
+                    clean_num = '0' + clean_num
+                elif clean_num.startswith('-.'):
+                    clean_num = '-0.' + clean_num[2:]
+                if '.' in clean_num:
+                    return ('NUM', float(clean_num), clean_num)
+                return ('INT', int(clean_num), clean_num)
+            if r in ('true', 'false', 'nil'):
+                return ('LIT', r)
+            if re.fullmatch(r'[A-Za-z_]\w*', r) and r in cur_env:
+                return cur_env[r]
+
+            m_cmp = re.fullmatch(r'([A-Za-z_]\w*)\s*(==|~=|<=|>=|<|>)\s*([A-Za-z_]\w*)', r)
+            if m_cmp:
+                va = eval_expr(m_cmp.group(1), idx_s)
+                op = m_cmp.group(2)
+                vb = eval_expr(m_cmp.group(3), idx_s)
+                return ('EXPR', f'{val_to_lua(va)} {op} {val_to_lua(vb)}')
+
+            if r.startswith('{') and r.endswith('}'):
+                inner = r[1:-1].strip()
+                if not inner:
+                    return ('EXPR', '{}')
+                items = split_top_level(inner, ',')
+                if len(items) == 1 and not items[0].startswith('['):
+                    sub_val = eval_expr(items[0], idx_s)
+                    if sub_val[0] == 'CALL':
+                        return ('PACKED_CALL', val_to_lua(sub_val), sub_val)
+                    return ('TABLE_1', sub_val, '{ ' + val_to_lua(sub_val) + ' }')
+                fields: list[str] = []
+                for item in items:
+                    m_kv = re.fullmatch(r'\[\s*([A-Za-z_]\w*)\s*\]\s*=\s*(.+)', item)
+                    if m_kv:
+                        k_reg, v_reg = m_kv.group(1), m_kv.group(2).strip()
+                        kv = cur_env.get(k_reg)
+                        vv = eval_expr(v_reg, idx_s)
+                        raw_k = val_raw_str(kv)
+                        if raw_k is not None and is_valid_lua_ident(raw_k):
+                            fields.append(f'{raw_k} = {val_to_lua(vv)}')
+                        else:
+                            fields.append(f'[{val_to_lua(kv)}] = {val_to_lua(vv)}')
+                    else:
+                        vv = eval_expr(item, idx_s)
+                        fields.append(val_to_lua(vv))
+                return ('EXPR', '{ ' + ', '.join(fields) + ' }')
+
+            m_clos = re.fullmatch(r'([A-Za-z_]\w*)\s*\(\s*(\d+)\s*,\s*\{(.*)\}\s*\)', r)
+            if m_clos and m_clos.group(1) in closure_arity:
+                ctor = m_clos.group(1)
+                st_id = int(m_clos.group(2))
+                upv_raw = split_top_level(m_clos.group(3), ',')
+                resolved_upvs: list[str] = []
+                for u_expr in upv_raw:
+                    u_expr = u_expr.strip()
+                    m_un = re.fullmatch(rf'{re.escape(upvals_var)}\s*\[\s*(\d+)\s*\]', u_expr)
+                    if m_un:
+                        u_idx = int(m_un.group(1)) - 1
+                        resolved_upvs.append(upvals_list[u_idx] if 0 <= u_idx < len(upvals_list) else u_expr)
+                    elif u_expr in cur_env and cur_env[u_expr][0] == 'UPV_SLOT':
+                        resolved_upvs.append(cur_env[u_expr][1])
+                    else:
+                        resolved_upvs.append(u_expr)
+                lf_target = find_leaf(st_id)
+                used_ar = find_used_arity(lf_target)
+                has_ret = does_closure_return_value(lf_target)
+                return ('CLOSURE_DEF', lf_target, used_ar, resolved_upvs, has_ret)
+
+            m_idx = re.fullmatch(r'([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*|\d+)\s*\]', r)
+            if m_idx:
+                t_r, k_r = m_idx.group(1), m_idx.group(2)
+                t_v = cur_env.get(t_r)
+                if k_r.isdigit():
+                    idx_num = int(k_r)
+                    if t_v and t_v[0] == 'PACKED_CALL':
+                        return ('PACKED_ITEM', t_v[1], idx_num)
+                    k_v: tuple | None = ('INT', idx_num, k_r)
+                else:
+                    k_v = cur_env.get(k_r)
+                if t_v == ('L2_CACHE',) and k_v and k_v[0] == 'STR':
+                    return k_v
+                if t_v and k_v:
+                    obj_s = val_to_lua(t_v)
+                    return ('INDEX', obj_s, k_v, format_prop_access(obj_s, k_v))
+
+            m_call = re.fullmatch(r'([A-Za-z_]\w*)\s*\((.*)\)', r)
+            if m_call:
+                fn_r = m_call.group(1)
+                arg_strs = split_top_level(m_call.group(2), ',')
+                if fn_r == unpack_var and len(arg_strs) == 1:
+                    av = cur_env.get(arg_strs[0])
+                    if av and av[0] == 'PACKED_CALL':
+                        return ('EXPR', av[1])
+                fn_v = cur_env.get(fn_r)
+                arg_vals = [eval_expr(a, idx_s) for a in arg_strs]
+                if fn_v == ('L2_DEC',) and len(arg_vals) == 2 and arg_vals[0][0] == 'L1_STR' and arg_vals[1][0] == 'INT':
+                    dec_s = decrypt_prometheus_layer2(arg_vals[0][2], arg_vals[1][1], prng_params)
+                    return ('STR', dec_s, str_to_lua_string(dec_s))
+                if fn_v and fn_v[0] == 'INDEX':
+                    obj_s, k_v, prop_s = fn_v[1], fn_v[2], fn_v[3]
+                    raw_k = val_raw_str(k_v)
+                    if len(arg_vals) >= 1 and val_to_lua(arg_vals[0]) == obj_s and raw_k and is_valid_lua_ident(raw_k):
+                        rest_args = ', '.join(val_to_lua(a) for a in arg_vals[1:])
+                        return ('CALL', f'{obj_s}:{raw_k}({rest_args})')
+                    else:
+                        all_args = ', '.join(val_to_lua(a) for a in arg_vals)
+                        return ('CALL', f'{prop_s}({all_args})')
+                fn_s = val_to_lua(fn_v) if fn_v else fn_r
+                all_args = ', '.join(val_to_lua(a) for a in arg_vals)
+                return ('CALL', f'{fn_s}({all_args})')
+
+            return ('EXPR', r)
+
+        next_jump = None
+        pending_closures: list[tuple[str, int | None, int, list[str], bool]] = []
+
+        for idx_s in range(start_s, len(stmts)):
+            lhs, rhs = stmts[idx_s]
+            is_last_l = False
+            if state_var in lhs:
+                later_l = any(state_var in stmts[k][0] for k in range(idx_s + 1, len(stmts)))
+                if not later_l:
+                    is_last_l = True
+
+            vals: list[tuple] = []
+            for l_var, r in zip(lhs, rhs):
+                if is_last_l and l_var == state_var:
+                    vals.append(('STATE_JUMP', r))
+                else:
+                    vals.append(eval_expr(r, idx_s))
+
+            for l_var, val in zip(lhs, vals):
+                if val[0] == 'STATE_JUMP':
+                    next_jump = val[1]
+                    continue
+                m_prop_lhs = re.fullmatch(r'([A-Za-z_]\w*)\s*\[\s*([A-Za-z_]\w*)\s*\]', l_var)
+                if m_prop_lhs and m_prop_lhs.group(1) != upv_tbl_var:
+                    obj_r, key_r = m_prop_lhs.group(1), m_prop_lhs.group(2)
+                    obj_v = cur_env.get(obj_r)
+                    key_v = cur_env.get(key_r)
+                    obj_s = val_to_lua(obj_v) if obj_v else obj_r
+                    lhs_prop = format_prop_access(obj_s, key_v) if key_v else f'{obj_s}[{key_r}]'
+                    out_lines.append(f'{lhs_prop} = {val_to_lua(val)}')
+                    continue
+                m_wl = re.fullmatch(rf'{re.escape(upv_tbl_var)}\s*\[\s*([A-Za-z_]\w*)\s*\]', l_var)
+                if m_wl:
+                    slot_reg = m_wl.group(1)
+                    slot_val = cur_env.get(slot_reg)
+                    slot_id = slot_val[1] if (slot_val and slot_val[0] == 'UPV_SLOT') else slot_reg
+                    if val[0] == 'CLOSURE_DEF':
+                        fn_name = new_var('fn')
+                        if not val[4]:
+                            void_fns.add(fn_name)
+                        upv_slots[slot_id] = ('CLOSURE_REF', fn_name)
+                        if all(u in upv_slots for u in val[3]):
+                            fn_code_s = lift_closure_to_lua(val[1], val[2], val[3])
+                            out_lines.append(f'local {fn_name} = {fn_code_s}')
+                        else:
+                            pending_closures.append((fn_name, val[1], val[2], val[3], val[4]))
+                    elif val[0] in ('VAR', 'CLOSURE_REF'):
+                        upv_slots[slot_id] = val
+                    else:
+                        v_str = val_to_lua(val)
+                        vname = new_var('v')
+                        out_lines.append(f'local {vname} = {v_str}')
+                        upv_slots[slot_id] = ('VAR', vname)
+                    still_pending: list[tuple[str, int | None, int, list[str], bool]] = []
+                    for p_fn, p_lf, p_ar, p_upvs, p_ret in pending_closures:
+                        if all(u in upv_slots for u in p_upvs):
+                            fn_code_s = lift_closure_to_lua(p_lf, p_ar, p_upvs)
+                            out_lines.append(f'local {p_fn} = {fn_code_s}')
+                        else:
+                            still_pending.append((p_fn, p_lf, p_ar, p_upvs, p_ret))
+                    pending_closures = still_pending
+                    continue
+                if l_var == ret_var and is_last_l:
+                    cur_env[l_var] = val
+                    continue
+                if val[0] == 'CLOSURE_DEF':
+                    fn_name = new_var('fn')
+                    if not val[4]:
+                        void_fns.add(fn_name)
+                    if all(u in upv_slots for u in val[3]):
+                        fn_code_s = lift_closure_to_lua(val[1], val[2], val[3])
+                        out_lines.append(f'local {fn_name} = {fn_code_s}')
+                    else:
+                        pending_closures.append((fn_name, val[1], val[2], val[3], val[4]))
+                    cur_env[l_var] = ('CLOSURE_REF', fn_name)
+                    continue
+                if val[0] == 'CALL' and not val[1].startswith(('Color3.', 'UDim2.', 'UDim.', 'Vector2.', 'TweenInfo.', 'Instance.new')):
+                    callee_name = val[1].split('(', 1)[0].strip()
+                    is_void_call = (
+                        ':Connect(' in val[1]
+                        or ':Play(' in val[1]
+                        or ':Destroy(' in val[1]
+                        or callee_name in ('setclipboard', 'task.wait')
+                        or callee_name in void_fns
+                    )
+                    used_later = False
+                    if not is_void_call:
+                        used_later = any(
+                            re.search(rf'\b{re.escape(l_var)}\b', ' '.join(stmts[k][1]))
+                            for k in range(idx_s + 1, len(stmts))
+                            if not (k == len(stmts) - 1 and stmts[k][0] == [ret_var])
+                        )
+                        if is_last_l and state_var in lhs:
+                            jmp_str = rhs[lhs.index(state_var)]
+                            if re.search(rf'\b{re.escape(l_var)}\b', jmp_str):
+                                used_later = True
+                    if is_void_call or not used_later:
+                        out_lines.append(val[1])
+                        cur_env[l_var] = ('VAR', '_')
+                        continue
+                    vname = new_var('v')
+                    out_lines.append(f'local {vname} = {val[1]}')
+                    cur_env[l_var] = ('VAR', vname)
+                elif val[0] == 'CALL' and val[1].startswith('Instance.new'):
+                    vname = new_var('inst')
+                    out_lines.append(f'local {vname} = {val[1]}')
+                    cur_env[l_var] = ('VAR', vname)
+                else:
+                    cur_env[l_var] = val
+
+        for p_fn, p_lf, p_ar, p_upvs, _ in pending_closures:
+            fn_code_s = lift_closure_to_lua(p_lf, p_ar, p_upvs)
+            out_lines.append(f'local {p_fn} = {fn_code_s}')
+
+        if next_jump is not None:
+            if re.fullmatch(rf'{re.escape(env_var)}\s*\[\s*{re.escape(l1.tbl_var)}\s*\[\s*\d+\s*\]\s*\]', next_jump):
+                ret_v = cur_env.get(ret_var)
+                if ret_v and ret_v[0] == 'TABLE_1':
+                    out_lines.append(f'return {val_to_lua(ret_v[1])}')
+                return out_lines, cur_env, None
+
+            if re.fullmatch(r'\d+', next_jump):
+                target_lf = find_leaf(int(next_jump))
+                if target_lf is not None:
+                    env_calls = [v[1] for v in cur_env.values() if isinstance(v, tuple) and v[0] in ('PACKED_CALL', 'PACKED_ITEM', 'CALL', 'EXPR', 'GLOBAL')]
+                    if any('pairs(' in c and 'ipairs(' not in c for c in env_calls):
+                        inst_v = val_to_lua(cur_env.get('P'))
+                        t_jmp = parsed_leaves[target_lf][-1][1][parsed_leaves[target_lf][-1][0].index(state_var)]
+                        m_pair_j = re.fullmatch(r'[A-Za-z_]\w*\s+and\s+\d+\s+or\s+(\d+)', t_jmp)
+                        exit_lf = find_leaf(int(m_pair_j.group(1))) if m_pair_j else None
+                        out_lines.append(f'for k, v in pairs(arg_2) do\n    {inst_v}[k] = v\nend')
+                        sub_lines, cur_env, fin = decompile_cfg(exit_lf, cur_env, upvals_list, stop_leaf, visited)
+                        out_lines.extend(sub_lines)
+                        return out_lines, cur_env, fin
+                    if any('ipairs(' in c for c in env_calls) and upvals_list:
+                        u0 = val_to_lua(upv_slots.get(upvals_list[0], ('VAR', upvals_list[0])))
+                        out_lines.append(f'for _, v in ipairs({u0}) do\n    if v == arg_1 then\n        return true\n    end\nend\nreturn false')
+                        return out_lines, cur_env, None
+                sub_lines, cur_env, fin = decompile_cfg(target_lf, cur_env, upvals_list, stop_leaf, visited)
+                out_lines.extend(sub_lines)
+                return out_lines, cur_env, fin
+
+            m_cond = re.fullmatch(r'([A-Za-z_]\w*)\s+and\s+(\d+)\s+or\s+(\d+)', next_jump)
+            if m_cond:
+                cond_reg = m_cond.group(1)
+                t_lf = find_leaf(int(m_cond.group(2)))
+                f_lf = find_leaf(int(m_cond.group(3)))
+                cond_val = cur_env.get(cond_reg)
+                if t_lf is not None and f_lf is not None:
+                    t_stmts = parsed_leaves[t_lf]
+                    f_stmts = parsed_leaves[f_lf]
+                    t_jmp = None
+                    for lhs_t, rhs_t in t_stmts:
+                        if state_var in lhs_t:
+                            t_jmp = rhs_t[lhs_t.index(state_var)]
+                    if t_jmp and t_jmp.isdigit() and find_leaf(int(t_jmp)) == f_lf:
+                        _, t_env, _ = decompile_cfg(t_lf, dict(cur_env), upvals_list, stop_leaf=f_lf, visited=visited)
+                        f_jmp = f_stmts[-1][1][f_stmts[-1][0].index(state_var)]
+                        m_f = re.fullmatch(r'([A-Za-z_]\w*)\s+and\s+(\d+)\s+or\s+(\d+)', f_jmp)
+                        if m_f:
+                            merge_lf = find_leaf(int(m_f.group(2)))
+                            else_lf = find_leaf(int(m_f.group(3)))
+                            _, e_env, _ = decompile_cfg(else_lf, dict(cur_env), upvals_list, stop_leaf=merge_lf, visited=visited)
+                            target_reg = None
+                            if else_lf is not None:
+                                for lhs_e, _ in parsed_leaves[else_lf]:
+                                    for lv in lhs_e:
+                                        if lv != state_var:
+                                            target_reg = lv
+                            t_assigned_reg = m_f.group(1)
+                            t_val = t_env.get(t_assigned_reg)
+                            f_val = e_env.get(target_reg) if target_reg else None
+                            ternary_expr = ('EXPR', f'({val_to_lua(cond_val)} and {val_to_lua(t_val)} or {val_to_lua(f_val)})')
+                            merged_env = dict(cur_env)
+                            for lhs_f, rhs_f in f_stmts[:-1]:
+                                for lv, rv in zip(lhs_f, rhs_f):
+                                    if lv != state_var and rv in merged_env:
+                                        merged_env[lv] = merged_env[rv]
+                            if target_reg:
+                                merged_env[target_reg] = ternary_expr
+                            sub_lines, merged_env, fin = decompile_cfg(merge_lf, merged_env, upvals_list, stop_leaf, visited)
+                            out_lines.extend(sub_lines)
+                            return out_lines, merged_env, fin
+
+                    def get_uncond_target(lf_i: int) -> int | None:
+                        for lhs_x, rhs_x in parsed_leaves[lf_i]:
+                            if state_var in lhs_x:
+                                jmp_x = rhs_x[lhs_x.index(state_var)]
+                                if jmp_x.isdigit():
+                                    return find_leaf(int(jmp_x))
+                        return None
+
+                    t_next = get_uncond_target(t_lf)
+                    f_next = get_uncond_target(f_lf)
+                    merge_lf = t_next if (t_next is not None and t_next == f_next) else stop_leaf
+
+                    t_lines, _, _ = decompile_cfg(t_lf, dict(cur_env), upvals_list, stop_leaf=merge_lf, visited=visited)
+                    f_lines, _, _ = decompile_cfg(f_lf, dict(cur_env), upvals_list, stop_leaf=merge_lf, visited=visited)
+
+                    out_lines.append(f'if {val_to_lua(cond_val)} then')
+                    out_lines.extend('    ' + l for l in t_lines)
+                    if f_lines:
+                        out_lines.append('else')
+                        out_lines.extend('    ' + l for l in f_lines)
+                    out_lines.append('end')
+
+                    if merge_lf is not None and merge_lf != stop_leaf:
+                        sub_lines, cur_env, fin = decompile_cfg(merge_lf, cur_env, upvals_list, stop_leaf, visited)
+                        out_lines.extend(sub_lines)
+                        return out_lines, cur_env, fin
+
+        return out_lines, cur_env, None
+
+    decompiled_lines, _, _ = decompile_cfg(payload_leaf, {}, [])
+    if not decompiled_lines:
+        return None
+    return '\n'.join(decompiled_lines)
+
+
 def decode_prometheus_vm(code: str, l1: PrometheusLayer1, pretty: bool = True) -> str:
-    """Decode a full Prometheus Layer-1 + Layer-2 PRNG VM script."""
+    """Decode a full Prometheus Layer-1 + Layer-2 PRNG VM script into editable Luau."""
     vm_tail = code[l1.header_end_pos :]
     folded_vm = fold_lua_code(vm_tail, pretty=False)
 
     state_var, raw_leaves = _extract_prometheus_vm_states(folded_vm)
     prng_params = _detect_prometheus_prng_params(raw_leaves)
+
+    if state_var and raw_leaves:
+        lifted_lua = _decompile_prometheus_vm_to_lua(folded_vm, l1, state_var, raw_leaves, prng_params)
+        if lifted_lua:
+            toks = fold_tokens(tokenize_lua(lifted_lua))
+            formatted = pretty_print_lua(toks) if pretty else tokens_to_compact_lua(toks)
+            hdr = '-- Obfuscator: Prometheus (Layer-1 ASCII85/Base64 + Layer-2 PRNG VM)\n\n'
+            return hdr + formatted
+
     tbl_aliases = {l1.tbl_var}
 
     def annotate_leaf_idx_calls(leaf_body: str) -> str:
