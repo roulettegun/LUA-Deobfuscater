@@ -1,9 +1,14 @@
-# Lua / Luau Deobfuscator
+# Coooool LUA / LUAU Deobfuscater 
 `lua_deobfuscator.py` it was mainly made for LUAU since most of the skid make script with key and post them saying it was keyless. it also statically unpacks, decrypts, and constant-folds obfuscated Lua 5.1 and Luau scripts without running untrusted code in a runtime. It parses input scripts down to raw tokens, strips common packer layers, solves string tables, and prints clean source code.
 - Standard library only (`argparse`, `dataclasses`, `re`, `math`, `pathlib`).
 - Safe static analysis (no `loadstring`, no subshells, no sandboxes).
 - Luau-native support (understands Luau inline `if-then-else` expressions, compound operators, and PCG32 random seeds).
 ---
+
+
+![Description](image.png)
+
+
 ## Common Commands
 ```bash
 # Auto detect algoritm
