@@ -2696,9 +2696,7 @@ def decode_prometheus_vm(code: str, l1: PrometheusLayer1, pretty: bool = True) -
         lifted_lua = _decompile_prometheus_vm_to_lua(folded_vm, l1, state_var, raw_leaves, prng_params)
         if lifted_lua:
             toks = fold_tokens(tokenize_lua(lifted_lua))
-            formatted = pretty_print_lua(toks) if pretty else tokens_to_compact_lua(toks)
-            hdr = '-- Obfuscator: Prometheus (Layer-1 ASCII85/Base64 + Layer-2 PRNG VM)\n\n'
-            return hdr + formatted
+            return pretty_print_lua(toks) if pretty else tokens_to_compact_lua(toks)
 
     tbl_aliases = {l1.tbl_var}
 
@@ -2726,37 +2724,7 @@ def decode_prometheus_vm(code: str, l1: PrometheusLayer1, pretty: bool = True) -
             ann_body = pretty_print_lua(tokenize_lua(ann_body))
         annotated_leaves.append((idx, low, high, ann_body))
 
-    lines: list[str] = []
-    lines.append('-- Obfuscator: Prometheus (Layer-1 ASCII85/Base64 + Layer-2 PRNG VM)')
-    lines.append(f'-- String Table Var    : {l1.tbl_var} ({len(l1.strings_bytes) - 1} entries)')
-    lines.append(f'-- Offset Function     : {l1.idx_fn or "<direct>"}(n) -> {l1.tbl_var}[n + ({l1.offset})]')
-    lines.append(f'-- VM State Variable   : {state_var} ({len(leaves)} leaf states)')
-    lines.append(f'-- Layer-2 PRNG Params : {prng_params}')
-    lines.append(f'-- Layer-2 Decrypted   : {len(all_decrypted)} strings')
-    lines.append('')
-    lines.append('-- [1] LAYER-2 DECRYPTED STRINGS (45-bit LCG + math.floor Rotation + math.random):')
-    seen: set[tuple[int, int]] = set()
-    for d_idx, seed, dec in all_decrypted:
-        if (d_idx, seed) not in seen:
-            seen.add((d_idx, seed))
-            lines.append(f'--   decrypt({l1.tbl_var}[{d_idx:3d}], {seed:15d}) -> {repr(dec)}')
-    lines.append('')
-    lines.append(f'-- [2] LAYER-1 READABLE STRINGS ({l1.tbl_var}):')
-    for idx in range(1, len(l1.strings_bytes)):
-        b = l1.strings_bytes[idx]
-        try:
-            txt = b.decode('utf-8')
-            if txt and txt.isprintable():
-                lines.append(f'--   {l1.tbl_var}[{idx:3d}] = {repr(txt)}')
-        except UnicodeDecodeError:
-            pass
-    lines.append('')
-    lines.append('-- [3] ANNOTATED & CONSTANT-FOLDED VM STATES:')
-    for idx, low, high, ann_body in annotated_leaves:
-        lines.append(f'\n-- --- Leaf #{idx} [{state_var} in {low}..{high}] ---')
-        lines.append(ann_body)
-
-    return '\n'.join(lines)
+    return '\n\n'.join(ann_body for _, _, _, ann_body in annotated_leaves)
 
 
 def decode_prometheus_strings(code: str, l1: PrometheusLayer1, pretty: bool = True) -> str:
@@ -2805,12 +2773,7 @@ def decode_prometheus_strings(code: str, l1: PrometheusLayer1, pretty: bool = Tr
         i += 1
 
     inlined = fold_tokens(inlined)
-    formatted = pretty_print_lua(inlined) if pretty else tokens_to_compact_lua(inlined)
-    hdr = (
-        f'-- Obfuscator: Prometheus String-Table\n'
-        f'-- Decoded {len(l1.strings_bytes) - 1} Layer-1 strings ({l1.tbl_var}, offset={l1.offset})\n\n'
-    )
-    return hdr + formatted
+    return pretty_print_lua(inlined) if pretty else tokens_to_compact_lua(inlined)
 
 
 
@@ -3195,11 +3158,7 @@ def decode_seeded_prng_cipher(code: str, mode_info: tuple[str, CustomLcgCipher |
         i += 1
 
     cleaned = fold_tokens(cleaned)
-    formatted = pretty_print_lua(cleaned) if pretty else tokens_to_compact_lua(cleaned)
-    hdr = (
-        '-- Obfuscator: Seeded math.randomseed + math.random (Luau PCG32)\n\n'
-    )
-    return hdr + formatted
+    return pretty_print_lua(cleaned) if pretty else tokens_to_compact_lua(cleaned)
 
 
 
@@ -3448,14 +3407,7 @@ def deobfuscate_lua(code: str, algo: str = 'auto', pretty: bool = True) -> str:
         out = decode_constant_array(cur_code, meta, pretty=pretty)  # type: ignore[arg-type]
     else:
         folded = fold_lua_code(cur_code, unescape_strings=True, pretty=pretty)
-        out = (
-            '-- Obfuscator: Math / Bit32 / String Expression & Escape Obfuscation\n\n'
-            + folded
-        )
-
-    if unwrapped_layers:
-        chain_hdr = '-- Unwrapped Outer Layers : ' + ' -> '.join(unwrapped_layers) + f' -> {detected_algo}\n'
-        out = chain_hdr + out
+        out = folded
 
     return out
 
