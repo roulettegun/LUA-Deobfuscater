@@ -28,6 +28,6 @@ Incoming files are fingerprinted by their header layout, control-flow dispatcher
 | `math_expression` | General math, bitwise, string-byte, and escape-sequence obfuscation | Precedence-exact constant folding for `math.*`, `bit32.*`, `string.*`, concatenations, and arithmetic. |
 ---
 ## Installation 
-### make sure u have git bud
+Please fork with your own code since it was not really good.
 ```bash
 git clone https://github.com/roulettegun/LUA-Deobfuscater/
