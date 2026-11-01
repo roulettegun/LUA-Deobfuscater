@@ -1,12 +1,12 @@
-# Lua / Luau Static Deobfuscator
-`lua_deobfuscator.py` statically unpacks, decrypts, and constant-folds obfuscated Lua 5.1 and Luau scripts without running untrusted code in a runtime. It parses input scripts down to raw tokens, strips common packer layers, solves string tables, and prints clean source code.
+# Lua / Luau Deobfuscator
+`lua_deobfuscator.py` it was mainly made for LUAU since most of the skid make script with key and post them saying it was keyless. it also statically unpacks, decrypts, and constant-folds obfuscated Lua 5.1 and Luau scripts without running untrusted code in a runtime. It parses input scripts down to raw tokens, strips common packer layers, solves string tables, and prints clean source code.
 - Standard library only (`argparse`, `dataclasses`, `re`, `math`, `pathlib`).
 - Safe static analysis (no `loadstring`, no subshells, no sandboxes).
 - Luau-native support (understands Luau inline `if-then-else` expressions, compound operators, and PCG32 random seeds).
 ---
 ## Common Commands
 ```bash
-# Auto-detect and deobfuscate to file
+# Auto detect algoritm
 python3 lua_deobfuscator.py input.lua output.lua
 # Quick inspection without writing to disk
 python3 lua_deobfuscator.py --detect-only input.lua
