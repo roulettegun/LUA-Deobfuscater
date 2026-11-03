@@ -20,8 +20,8 @@ python3 lua_deobfuscator.py input.lua output.lua --algo rolling_xor_table
 python3 lua_deobfuscator.py input.lua output.lua --no-format
 ```
 ---
-## Detection & Algorithm Pipeline
-Incoming files are fingerprinted by their header layout, control-flow dispatchers, and cipher loops:
+## Detection & Algorithm Method
+cool method:
 | Engine | Target Pattern | What it does |
 |---|---|---|
 | `loadstring_packer` | `loadstring("...")()`, `string.char(...)` payloads, byte XOR loops | Unwraps `loadstring("...")()` and byte XOR/add/sub loops recursively up to 5 layers deep. |
